@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -300,3 +301,190 @@ def test_additive_schema_upgrade_adds_new_workflow_fields(monkeypatch: pytest.Mo
     assert 'assessment_type' in assessment_columns
     assert {'expected_result', 'resources_required'} <= action_columns
     old_engine.dispose()
+
+
+def test_smca_scope_bia_controls_and_cartography(client: TestClient) -> None:
+    headers = login(client)
+    scope = client.put(
+        '/api/smca/scope',
+        headers=headers,
+        json={
+            'name': 'Critical services scope',
+            'description': 'Business continuity scope for essential digital and financial services.',
+            'objectives': 'Keep critical services within agreed recovery targets.',
+            'status': 'Approved',
+            'acceptance_threshold': 8,
+        },
+    )
+    assert scope.status_code == 200
+    assert scope.json()['acceptance_threshold'] == 8
+
+    bia = client.post(
+        '/api/activities/1/bia',
+        headers=headers,
+        json={
+            'financial_impact': 4,
+            'operational_impact': 5,
+            'legal_impact': 3,
+            'reputational_impact': 4,
+            'rto_hours': 4,
+            'rpo_hours': 1,
+            'mtpd_hours': 12,
+            'dependencies': 'Electricity, network and database services.',
+            'recovery_requirements': 'Restore redundant hosting before dependent applications.',
+        },
+    )
+    assert bia.status_code == 201
+    assert bia.json()['criticality'] == 5
+
+    risk = client.post(
+        '/api/risks',
+        headers=headers,
+        json={
+            'code': 'GOV-001',
+            'name': 'Governance test risk',
+            'description': 'Risk used to validate SMCA controls and cartography.',
+            'category': 'Operational',
+            'department_id': 1,
+            'activity_id': 1,
+            'probability': 3,
+            'impact': 4,
+        },
+    )
+    assert risk.status_code == 201
+    risk_id = risk.json()['id']
+    control = client.post(
+        f'/api/risks/{risk_id}/controls',
+        headers=headers,
+        json={
+            'name': 'Quarterly failover test',
+            'description': 'Test service failover and retain evidence.',
+            'control_type': 'Corrective',
+            'effectiveness': 4,
+            'status': 'Implemented',
+            'next_test_date': '2030-01-10T00:00:00Z',
+        },
+    )
+    assert control.status_code == 201
+    assert control.json()['next_test_date'].startswith('2030-01-10')
+
+    methodology = client.get('/api/methodology', headers=headers)
+    assert methodology.status_code == 200
+    assert methodology.json()['acceptance_threshold'] == 8
+    map_rows = client.get('/api/cartography', headers=headers).json()
+    mapped = next(item for item in map_rows if item['id'] == risk_id)
+    assert mapped['score'] == 12
+    assert mapped['status'] == 'Draft'
+
+
+def test_dependencies_incidents_indicators_attachments_and_exports(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv('STORAGE_DIR', str(tmp_path / 'evidence'))
+    headers = login(client)
+    dependency = client.post(
+        '/api/activity-dependencies',
+        headers=headers,
+        json={
+            'source_activity_id': 1,
+            'target_activity_id': 2,
+            'dependency_type': 'Technology',
+            'criticality': 4,
+            'description': 'Hosting requires payment integration for full service recovery.',
+        },
+    )
+    assert dependency.status_code == 201
+    assert client.get('/api/activity-dependencies', headers=headers).json()[0]['criticality'] == 4
+    assert client.get('/api/threat-library', headers=headers).json()
+
+    risk_id = next(item['id'] for item in client.get('/api/risks', headers=headers).json() if item['code'] == 'RISK-001')
+    indicator = client.post(
+        f'/api/risks/{risk_id}/indicators',
+        headers=headers,
+        json={
+            'name': 'Failed backup jobs',
+            'unit': 'jobs',
+            'direction': 'Above is bad',
+            'warning_threshold': 2,
+            'critical_threshold': 5,
+            'current_value': 6,
+            'frequency': 'Daily',
+        },
+    )
+    assert indicator.status_code == 201
+    assert indicator.json()['status'] == 'Critical'
+
+    incident = client.post(
+        '/api/incidents',
+        headers=headers,
+        json={
+            'code': 'INC-TEST-001',
+            'title': 'Production interruption',
+            'description': 'A real interruption used to validate incident learning.',
+            'severity': 'Major',
+            'status': 'Investigating',
+            'occurred_at': datetime.now(timezone.utc).isoformat(),
+            'department_id': 1,
+            'risk_id': risk_id,
+            'impact': 'Service unavailable for twenty minutes.',
+        },
+    )
+    assert incident.status_code == 201
+    resolved = client.patch(
+        f"/api/incidents/{incident.json()['id']}",
+        headers=headers,
+        json={'status': 'Resolved', 'lessons_learned': 'Add an automated failover verification.'},
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()['resolved_at']
+
+    attachment = client.post(
+        f'/api/risks/{risk_id}/attachments',
+        headers=headers,
+        files={'file': ('test-evidence.txt', b'failover test evidence', 'text/plain')},
+        data={'description': 'Automated test evidence'},
+    )
+    assert attachment.status_code == 201
+    attachment_id = attachment.json()['id']
+    downloaded = client.get(f'/api/risk-attachments/{attachment_id}/download', headers=headers)
+    assert downloaded.status_code == 200
+    assert downloaded.content == b'failover test evidence'
+
+    pdf = client.get('/api/reports/export?format=pdf', headers=headers)
+    excel = client.get('/api/reports/export?format=excel', headers=headers)
+    assert pdf.status_code == 200 and pdf.content.startswith(b'%PDF')
+    assert excel.status_code == 200 and excel.content.startswith(b'PK')
+
+
+def test_risk_lifecycle_cookie_session_and_password_change(client: TestClient) -> None:
+    login_response = client.post('/api/auth/login', json={'username': 'admin', 'password': 'admin123'})
+    assert login_response.status_code == 200
+    assert client.get('/api/me').status_code == 200
+    risk_id = next(item['id'] for item in client.get('/api/risks').json() if item['code'] == 'RISK-001')
+
+    rejected_acceptance = client.patch(
+        f'/api/risks/{risk_id}',
+        json={'status': 'Accepted'},
+    )
+    assert rejected_acceptance.status_code == 422
+    accepted = client.patch(
+        f'/api/risks/{risk_id}',
+        json={
+            'status': 'Accepted',
+            'acceptance_justification': 'Residual exposure is within the approved risk appetite.',
+            'review_date': '2030-02-01T00:00:00Z',
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()['status'] == 'Accepted'
+
+    changed = client.post(
+        '/api/auth/change-password',
+        json={'current_password': 'admin123', 'new_password': 'new-admin-password-2026'},
+    )
+    assert changed.status_code == 200
+    client.post('/api/auth/logout')
+    assert client.get('/api/me').status_code == 401
+    assert client.post('/api/auth/login', json={'username': 'admin', 'password': 'new-admin-password-2026'}).status_code == 200

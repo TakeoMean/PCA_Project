@@ -1,5 +1,7 @@
 # Full application test scenario
 
+> This document keeps the original treatment-workflow test. For the complete ContinuityOS v2 SMCA process and the current French interface, use [SMCA_ACCEPTANCE_SCENARIO.md](./SMCA_ACCEPTANCE_SCENARIO.md).
+
 Follow this walkthrough to test the risk register, treatment approval, action tracking, residual-risk reassessment, user roles, and report exports.
 
 ## What you need

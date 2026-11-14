@@ -2,6 +2,10 @@ services:
   db:
     image: postgres:16-alpine
     environment:
+      APP_ENV: development
+      SEED_DEMO_DATA: 'true'
+      COOKIE_SECURE: 'false'
+      STORAGE_DIR: /app/storage
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
@@ -32,6 +36,8 @@ services:
       FRONTEND_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
     ports:
       - '8000:8000'
+    volumes:
+      - evidence_data:/app/storage
     depends_on:
       db:
         condition: service_healthy
@@ -45,13 +51,12 @@ services:
   frontend:
     build:
       context: ./frontend
-    environment:
-      VITE_BACKEND_PROXY: http://backend:8000
     ports:
-      - '5173:5173'
+      - '5173:80'
     depends_on:
       backend:
         condition: service_healthy
 
 volumes:
   postgres_data:
+  evidence_data:
