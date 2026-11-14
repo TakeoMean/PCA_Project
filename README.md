@@ -1,72 +1,84 @@
-# ContinuityOS — SMCA Risk Management
+# ContinuityOS — cartographie des risques SMCA
 
-A web application for business-continuity risk assessment, treatment planning and governance. It includes a React dashboard, FastAPI API, PostgreSQL database, role-based access and PDF/XLSX exports.
+ContinuityOS est une application web de management de la continuité d’activité. Elle couvre le processus allant du cadrage du SMCA à la surveillance du risque résiduel, avec une interface React en français, une API FastAPI, PostgreSQL et un contrôle d’accès par rôles.
 
-## Run the complete application
+## Fonctions principales
 
-1. Install Docker Desktop and start it.
-2. From this folder, create the local environment file:
+- périmètre et objectifs du SMCA, seuil d’acceptation et date de revue ;
+- BIA par activité avec impacts, criticité, MTPD, RTO, RPO et exigences de reprise ;
+- cartographie structurée des dépendances entre activités ;
+- bibliothèque réutilisable de menaces, causes et vulnérabilités ;
+- registre des risques avec cycle de vie, responsable, sources, mesures existantes et historique ;
+- matrice interactive 5×5 avec comparaison du risque inhérent, courant et résiduel ;
+- contrôles préventifs, détectifs et correctifs avec efficacité, preuve et calendrier de test ;
+- plans de traitement soumis à une validation indépendante, actions et réévaluation résiduelle ;
+- KRI avec seuils d’alerte et seuils critiques ;
+- incidents, impacts constatés et enseignements liés aux risques ;
+- pièces justificatives privées rattachées aux risques ;
+- alertes sur les revues, contrôles, actions, traitements et BIA manquantes ;
+- rôles, périmètres départementaux, journal d’audit et exports PDF/XLSX.
+
+## Démarrage avec Docker
+
+1. Créer le fichier d’environnement :
 
    ```powershell
    Copy-Item .env.example .env
    ```
-3. Edit `.env` before sharing or deploying the project. Replace `POSTGRES_PASSWORD` and `SECRET_KEY` with strong, unique values. The demo accounts are only for a local demonstration.
-4. Start the services:
+
+2. Remplacer au minimum `POSTGRES_PASSWORD` et `SECRET_KEY`.
+
+3. Démarrer l’application :
 
    ```powershell
    docker compose up --build
    ```
-5. Open [http://localhost:5173](http://localhost:5173). The API and interactive API documentation are available at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs).
 
-The backend waits for PostgreSQL's health check before starting. PostgreSQL data is stored in the `postgres_data` Docker volume and is retained when containers stop.
+4. Ouvrir <http://localhost:5173>. L’API et sa documentation sont disponibles sur <http://localhost:8000/docs>.
 
-For the AWS Learner Lab deployment walkthrough, security controls, and production architecture recommendations, see [DEPLOY_AWS.md](./DEPLOY_AWS.md).
+Le frontend Docker est compilé pour la production puis servi par Nginx. L’API applique automatiquement les migrations Alembic au démarrage. Les données PostgreSQL et les pièces justificatives sont conservées dans des volumes séparés.
 
-### Demo accounts
+### Comptes de démonstration
 
-The example environment creates:
+Uniquement lorsque `SEED_DEMO_DATA=true` :
 
-- Administrator: `admin` / `admin123`
-- Risk Manager: `riskmanager` / `admin123`
-- SMCA Manager: `smcamanager` / `admin123`
+- `admin` / `admin123`
+- `riskmanager` / `admin123`
+- `smcamanager` / `admin123`
 
-Set the corresponding `DEMO_*_PASSWORD` values in `.env` before the first database start to change these passwords. Seed accounts are not reset on later starts.
+Changez les variables `DEMO_*_PASSWORD` avant la première initialisation.
 
-## Treatment workflow
+## Production
 
-1. A Risk Manager or Department Manager proposes an avoid, reduce, transfer or accept plan.
-2. A different Administrator or SMCA Manager approves or rejects the proposal with a review note; self-approval is blocked.
-3. An approved plan is started and broken into owned, dated actions.
-4. Action owners move work through Planned, In progress, Blocked and Completed.
-5. The plan can be completed only after all actions are complete and residual probability and impact (1–5) are entered. The application records a residual assessment and recalculates the score.
+Configurer au minimum :
 
-Plans and actions have a guarded status lifecycle; rejected, completed and cancelled plans cannot be silently reopened. Important changes are written to the audit trail.
+```text
+APP_ENV=production
+SEED_DEMO_DATA=false
+COOKIE_SECURE=true
+SECRET_KEY=<secret fort et unique>
+BOOTSTRAP_ADMIN_USERNAME=<administrateur initial>
+BOOTSTRAP_ADMIN_EMAIL=<adresse contrôlée>
+BOOTSTRAP_ADMIN_PASSWORD=<mot de passe temporaire fort>
+```
 
-## Roles
+Le démarrage échoue volontairement en production si la clé de signature reste la valeur locale ou si une base vide ne possède aucun administrateur d’amorçage. Le compte initial doit changer son mot de passe à la première connexion.
 
-| Role               | Scope and capabilities                                                      |
-| ------------------ | --------------------------------------------------------------------------- |
-| Administrator      | Full access, user administration, organisation setup and treatment approval |
-| SMCA Manager       | Organisation-wide risk governance, treatment approval, reports and audit    |
-| Risk Manager       | Organisation-wide risk analysis, assessment and treatment management        |
-| Department Manager | Department-scoped risk access, assessment and treatment proposals           |
-| Auditor            | Read-only risk, report and audit access                                     |
+Pour l’architecture AWS cible, consulter [DEPLOY_AWS.md](./DEPLOY_AWS.md). Pour RHEL 9.5, consulter [DEPLOY_RHEL_9_5.md](./DEPLOY_RHEL_9_5.md).
 
-Authorization is enforced by the API, not only hidden in the interface. Department Managers are restricted to their assigned department.
+## Développement local
 
-## Local development without Docker
-
-The backend now defaults to PostgreSQL. Start a PostgreSQL 16 instance and set the connection string and signing secret before launching the API:
+Backend :
 
 ```powershell
-$env:DATABASE_URL = "postgresql+psycopg://smca:your-password@localhost:5432/smca"
-$env:SECRET_KEY = "replace-this-with-a-long-random-secret"
+$env:DATABASE_URL = "postgresql+psycopg://smca:mot-de-passe@localhost:5432/smca"
+$env:SECRET_KEY = "une-cle-locale-longue-et-aleatoire"
 Set-Location backend
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 python -m uvicorn app.main:app --reload
 ```
 
-In another terminal:
+Frontend :
 
 ```powershell
 Set-Location frontend
@@ -74,12 +86,38 @@ npm ci
 npm run dev
 ```
 
-The Vite development server proxies `/api` requests to `http://localhost:8000` by default. Override `VITE_BACKEND_PROXY` if the API runs elsewhere.
+Le serveur Vite relaie `/api` vers `http://localhost:8000`. Utiliser `VITE_BACKEND_PROXY` pour une autre adresse.
 
-## Database upgrade
+## Migrations
 
-On startup, the API creates missing tables and applies the small additive schema upgrade required for existing SQLite/PostgreSQL installations. Existing risk and user data is preserved.
+Les migrations se trouvent dans `backend/alembic/versions`. Elles sont appliquées automatiquement par l’API. Elles peuvent aussi être lancées manuellement :
 
-## Reporting
+```powershell
+Set-Location backend
+alembic upgrade head
+```
 
-Use the Reports & audit page to export the risk register as PDF or XLSX. Exported data follows the signed-in user's department scope.
+## Tests
+
+```powershell
+Set-Location backend
+python -m pytest -q
+
+Set-Location ..\frontend
+npm test
+npm run build
+```
+
+Les tests couvrent le workflow de traitement, les droits départementaux, l’audit, le périmètre SMCA, la BIA, les contrôles, les dépendances, les incidents, les KRI, les pièces justificatives, les exports et l’authentification par cookie.
+
+## Sécurité intégrée
+
+- autorisations vérifiées côté API ;
+- cookie de session `HttpOnly`, `SameSite=Lax` et `Secure` en production ;
+- limitation des tentatives de connexion ;
+- séparation entre auteur et approbateur d’un traitement ;
+- mots de passe temporaires avec changement obligatoire ;
+- exports générés en mémoire et protégés contre l’injection de formules ;
+- fichiers limités en taille et en extensions, stockés hors du frontend ;
+- image backend exécutée avec un utilisateur non privilégié ;
+- en-têtes de sécurité et CSP sur le frontend Nginx.

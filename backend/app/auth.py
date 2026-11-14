@@ -3,18 +3,23 @@ import os
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import User
 
-SECRET_KEY = os.getenv('SECRET_KEY', 'local-development-secret-change-before-deployment')
+APP_ENV = os.getenv('APP_ENV', 'development').strip().lower()
+DEFAULT_DEVELOPMENT_SECRET = 'local-development-secret-change-before-deployment'
+SECRET_KEY = os.getenv('SECRET_KEY', DEFAULT_DEVELOPMENT_SECRET)
+if APP_ENV == 'production' and SECRET_KEY == DEFAULT_DEVELOPMENT_SECRET:
+    raise RuntimeError('SECRET_KEY must be explicitly configured in production')
 ALGORITHM = 'HS256'
 ACCESS_TOKEN_EXPIRE_MINUTES = 120
+AUTH_COOKIE_NAME = 'continuityos_session'
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/api/auth/login')
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/api/auth/login', auto_error=False)
 pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
 
 
@@ -40,14 +45,21 @@ def get_user_by_username(db: Session, username: str) -> User | None:
     return db.query(User).filter(User.username == username).first()
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def get_current_user(
+    token: str | None = Depends(oauth2_scheme),
+    cookie_token: str | None = Cookie(default=None, alias=AUTH_COOKIE_NAME),
+    db: Session = Depends(get_db),
+) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail='Could not validate credentials',
         headers={'WWW-Authenticate': 'Bearer'},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        selected_token = token or cookie_token
+        if not selected_token:
+            raise credentials_exception
+        payload = jwt.decode(selected_token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get('sub')
         if username is None:
             raise credentials_exception
@@ -63,6 +75,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 ROLE_PERMISSIONS = {
     'Administrator': frozenset({
         'audit:read',
+        'bia:manage',
+        'controls:manage',
+        'incidents:manage',
+        'indicators:manage',
         'departments:write',
         'reports:read',
         'risks:assess',
@@ -74,6 +90,10 @@ ROLE_PERMISSIONS = {
     }),
     'SMCA Manager': frozenset({
         'audit:read',
+        'bia:manage',
+        'controls:manage',
+        'incidents:manage',
+        'indicators:manage',
         'departments:write',
         'reports:read',
         'risks:assess',
@@ -84,6 +104,10 @@ ROLE_PERMISSIONS = {
     }),
     'Risk Manager': frozenset({
         'audit:read',
+        'bia:manage',
+        'controls:manage',
+        'incidents:manage',
+        'indicators:manage',
         'reports:read',
         'risks:assess',
         'risks:create',
@@ -91,6 +115,10 @@ ROLE_PERMISSIONS = {
         'treatments:manage',
     }),
     'Department Manager': frozenset({
+        'bia:manage',
+        'controls:manage',
+        'incidents:manage',
+        'indicators:manage',
         'risks:assess',
         'risks:create',
         'risks:read',

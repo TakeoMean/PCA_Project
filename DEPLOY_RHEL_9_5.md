@@ -2,7 +2,7 @@
 
 This guide transfers the current project to a RHEL 9.5 server and runs its PostgreSQL, FastAPI, and React services with Docker Compose.
 
-> **Deployment scope:** the current Compose setup is suitable for a class/demo or a restricted test server. The frontend container runs Vite's development server, and the backend creates demo accounts. Do not expose this version directly to the public internet or treat it as production-ready. The production hardening checklist at the end must be completed before public use.
+> **Deployment scope:** the current Compose setup serves a compiled React build through Nginx, but its example configuration enables demo accounts and plain HTTP. It is suitable for a class/demo or a restricted test server. Do not expose it directly to the public internet without completing the production hardening checklist.
 
 ## 1. Check the target server
 
@@ -166,7 +166,7 @@ Change **only** the `ports` entries to:
 
   frontend:
     ports:
-      - '127.0.0.1:5173:5173'
+      - '127.0.0.1:5173:80'
 ```
 
 Keep the existing services, health checks, and named `postgres_data` volume. The containers can still reach one another using their Compose service names. Binding these ports to loopback means users on other machines cannot browse directly to them.
@@ -306,7 +306,7 @@ sudo docker compose logs --tail=100 frontend backend
 curl --fail http://127.0.0.1:8000/api/health
 ```
 
-Check that the frontend uses the supplied `VITE_BACKEND_PROXY: http://backend:8000` and that the backend is healthy.
+Check that the Nginx `/api/` proxy targets `http://backend:8000` and that the backend is healthy.
 
 ### Browser cannot connect through the SSH tunnel
 
@@ -319,10 +319,10 @@ Check that the frontend uses the supplied `VITE_BACKEND_PROXY: http://backend:80
 
 The steps above are for a restricted demo. Before using real organisational or personal data, have the system owner and security administrator review the design and at least:
 
-- Replace the Vite development server container with a production frontend build served by a production web server.
+- Keep the compiled frontend image and put a maintained TLS endpoint or reverse proxy in front of it.
 - Put a maintained TLS reverse proxy in front of the app; do not send passwords or bearer tokens over public plain HTTP.
 - Keep PostgreSQL and the backend unreachable from user networks; allow only the frontend/reverse proxy and administrators to reach their required endpoints.
-- Remove automatic demo accounts and seed passwords from the production deployment path; create the initial administrator through a controlled one-time setup.
+- Set `APP_ENV=production`, `SEED_DEMO_DATA=false`, `COOKIE_SECURE=true`, and create the initial administrator with the controlled one-time `BOOTSTRAP_ADMIN_*` variables.
 - Require unique, strong passwords and a protected signing secret; document rotation and recovery procedures.
 - Review role permissions, department-level data access, audit retention, backup retention, and recovery objectives with the organisation.
 - Patch RHEL, container images, Python and npm dependencies; pin and scan deployable image versions.

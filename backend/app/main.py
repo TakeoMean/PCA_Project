@@ -1,18 +1,29 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
+import re
+from collections import defaultdict, deque
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
+from alembic import command
+from alembic.config import Config
+from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
+from openpyxl import load_workbook
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.auth import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    APP_ENV,
+    AUTH_COOKIE_NAME,
     ROLE_PERMISSIONS,
     can_access_department,
     create_access_token,
@@ -27,18 +38,25 @@ from app.models import (
     Activity,
     AuditLog,
     Department,
+    Incident,
     Resource,
     Risk,
     RiskAssessment,
+    RiskControl,
+    RiskIndicator,
     RiskTreatment,
     Role,
     TreatmentAction,
+    ThreatScenario,
     User,
 )
-from app.schema_upgrade import upgrade_schema
 from app.schemas import (
+    LoginRequest,
+    PasswordChange,
+    PasswordReset,
     RiskAssessmentCreate,
     RiskCreate,
+    RiskUpdate,
     RiskTreatmentCreate,
     TreatmentActionCreate,
     TreatmentActionUpdate,
@@ -47,11 +65,13 @@ from app.schemas import (
     UserCreate,
     UserUpdate,
 )
+from app.smca import router as smca_router
+from app.governance import router as governance_router
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-    Base.metadata.create_all(bind=engine)
-    upgrade_schema()
+    alembic_config = Config(str(Path(__file__).resolve().parent.parent / 'alembic.ini'))
+    command.upgrade(alembic_config, 'head')
     with SessionLocal() as db:
         _ensure_seed_data(db)
     yield
@@ -65,6 +85,14 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+app.include_router(smca_router)
+app.include_router(governance_router)
+
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+LOGIN_WINDOW_SECONDS = 5 * 60
+LOGIN_MAX_FAILURES = 8
+_login_attempts: dict[str, deque[datetime]] = defaultdict(deque)
+_login_attempts_lock = Lock()
 
 
 def _utcnow() -> datetime:
@@ -79,6 +107,37 @@ def _normalize_datetime(value: datetime | None) -> datetime | None:
     return value
 
 
+def _login_key(request: Request, username: str) -> str:
+    host = request.client.host if request.client else 'unknown'
+    return f'{host}:{username.strip().lower()}'
+
+
+def _login_is_limited(key: str) -> bool:
+    cutoff = _utcnow().timestamp() - LOGIN_WINDOW_SECONDS
+    with _login_attempts_lock:
+        attempts = _login_attempts[key]
+        while attempts and attempts[0].timestamp() < cutoff:
+            attempts.popleft()
+        return len(attempts) >= LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(key: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts[key].append(_utcnow())
+
+
+def _clear_login_failures(key: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(key, None)
+
+
+def _cookie_secure() -> bool:
+    configured = os.getenv('COOKIE_SECURE')
+    if configured is not None:
+        return configured.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return APP_ENV == 'production'
+
+
 def _risk_level(score: int) -> str:
     if score <= 4:
         return 'Low'
@@ -87,6 +146,61 @@ def _risk_level(score: int) -> str:
     if score <= 16:
         return 'High'
     return 'Critical'
+
+
+def _normalize_column_name(value: str | None) -> str:
+    if value is None:
+        return ''
+    return re.sub(r'[^a-z0-9]+', ' ', value.strip().lower()).strip().replace(' ', '_')
+
+
+def _normalize_import_value(value: object) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _read_risk_import_rows(file_bytes: bytes, filename: str) -> list[dict[str, str]]:
+    name = (filename or '').lower()
+    if name.endswith('.csv'):
+        text_stream = io.StringIO(file_bytes.decode('utf-8-sig'))
+        return [dict(row) for row in csv.DictReader(text_stream)]
+    if name.endswith('.xlsx'):
+        workbook = load_workbook(filename=io.BytesIO(file_bytes), read_only=True, data_only=True)
+        sheet = workbook.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            return []
+        headers = [_normalize_import_value(value) for value in rows[0]]
+        normalized_headers = [_normalize_column_name(value) for value in headers]
+        data_rows: list[dict[str, str]] = []
+        for row in rows[1:]:
+            if not any(_normalize_import_value(value) for value in row):
+                continue
+            item = {}
+            for index, value in enumerate(row):
+                key = normalized_headers[index] if index < len(normalized_headers) else f'column_{index + 1}'
+                item[key] = _normalize_import_value(value)
+            data_rows.append(item)
+        return data_rows
+    raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail='Only CSV and XLSX files are supported')
+
+
+def _find_optional_user(db: Session, value: str | None, fallback: User) -> User | None:
+    if value is None or not value.strip():
+        return fallback
+    candidate = value.strip()
+    for field in ('username', 'full_name', 'email'):
+        user = db.query(User).filter(getattr(User, field) == candidate).first()
+        if user:
+            return user
+    for field in ('username', 'full_name', 'email'):
+        user = db.query(User).filter(getattr(User, field).ilike(candidate)).first()
+        if user:
+            return user
+    return None
 
 
 def _audit(
@@ -138,6 +252,50 @@ def _ensure_seed_data(db: Session) -> None:
     risk_manager_role = get_or_create_role('Risk Manager', 'Risk analysis and planning')
     get_or_create_role('Department Manager', 'Department-level risk ownership')
     get_or_create_role('Auditor', 'Read-only validation access')
+
+    threat_catalogue = [
+        ('Power or utility outage', 'Environmental', 'Loss of electricity, cooling, water or telecommunications.', 'External utility failure; local equipment fault', 'Single feed; untested backup power', 3),
+        ('Cyberattack or ransomware', 'Cybersecurity', 'Malicious compromise causing loss of availability or data.', 'Phishing; exposed service; vulnerable software', 'Weak segmentation; untested restore; obsolete protection', 4),
+        ('Critical supplier failure', 'Supplier', 'Failure or prolonged unavailability of an essential third party.', 'Supplier outage; insolvency; geopolitical disruption', 'Single supplier; weak SLA; no exit plan', 3),
+        ('IT infrastructure failure', 'Technical', 'Failure of servers, storage, network or cloud services.', 'Hardware fault; capacity saturation; change failure', 'No redundancy; weak monitoring; configuration drift', 3),
+        ('Loss of key personnel', 'Human', 'Unavailability of people holding critical knowledge or authority.', 'Illness; strike; resignation; access disruption', 'No deputy; undocumented procedures; skill concentration', 2),
+        ('Site inaccessibility', 'Environmental', 'A critical site cannot be occupied or reached.', 'Fire; flood; civil disturbance; transport disruption', 'Single site; no remote-work capability; weak evacuation plan', 2),
+        ('Data corruption or loss', 'Technical', 'Critical information becomes unavailable, incorrect or unrecoverable.', 'Human error; software defect; malicious deletion', 'Untested backups; excessive privileges; no versioning', 3),
+    ]
+    for name, category, description, causes, vulnerabilities, probability in threat_catalogue:
+        if not db.query(ThreatScenario).filter(ThreatScenario.name == name).first():
+            db.add(ThreatScenario(
+                name=name,
+                category=category,
+                description=description,
+                common_causes=causes,
+                common_vulnerabilities=vulnerabilities,
+                default_probability=probability,
+            ))
+    db.commit()
+
+    seed_demo_default = 'false' if APP_ENV == 'production' else 'true'
+    seed_demo = os.getenv('SEED_DEMO_DATA', seed_demo_default).strip().lower() in {'1', 'true', 'yes', 'on'}
+    if not seed_demo:
+        bootstrap_username = os.getenv('BOOTSTRAP_ADMIN_USERNAME', '').strip()
+        bootstrap_password = os.getenv('BOOTSTRAP_ADMIN_PASSWORD', '')
+        bootstrap_email = os.getenv('BOOTSTRAP_ADMIN_EMAIL', '').strip()
+        if bootstrap_username and bootstrap_password and bootstrap_email:
+            if not db.query(User).filter(User.username == bootstrap_username).first():
+                db.add(User(
+                    username=bootstrap_username,
+                    email=bootstrap_email,
+                    full_name=os.getenv('BOOTSTRAP_ADMIN_FULL_NAME', 'ContinuityOS Administrator').strip(),
+                    password_hash=hash_password(bootstrap_password),
+                    role_id=admin_role.id,
+                    department_id=None,
+                    is_active=True,
+                    must_change_password=True,
+                ))
+                db.commit()
+        elif APP_ENV == 'production' and db.query(User).count() == 0:
+            raise RuntimeError('Production requires BOOTSTRAP_ADMIN_USERNAME, BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD')
+        return
 
     it_department = get_or_create_department('IT', 'Infrastructure and application operations')
     finance_department = get_or_create_department('Finance', 'Financial systems and controls')
@@ -192,6 +350,7 @@ def _ensure_seed_data(db: Session) -> None:
             role_id=admin_role.id,
             department_id=it_department.id,
             is_active=True,
+            must_change_password=False,
         )
         db.add(admin)
         db.commit()
@@ -207,6 +366,7 @@ def _ensure_seed_data(db: Session) -> None:
             role_id=risk_manager_role.id,
             department_id=it_department.id,
             is_active=True,
+            must_change_password=False,
         )
         db.add(risk_manager)
         db.commit()
@@ -225,6 +385,7 @@ def _ensure_seed_data(db: Session) -> None:
             role_id=smca_manager_role.id,
             department_id=None,
             is_active=True,
+            must_change_password=False,
         )
         db.add(smca_manager)
         db.commit()
@@ -364,6 +525,7 @@ def _serialize_assessment(assessment: RiskAssessment | None) -> dict | None:
     if assessment is None:
         return None
     return {
+        'id': assessment.id,
         'probability': assessment.probability,
         'impact': assessment.impact,
         'score': assessment.score,
@@ -398,13 +560,28 @@ def _serialize_risk(risk: Risk) -> dict:
         'impact': latest.impact if latest else 0,
         'score': latest.score if latest else 0,
         'level': latest.level if latest else 'Unassessed',
+        'current_assessment_type': latest.assessment_type if latest else None,
         'inherent_assessment': _serialize_assessment(inherent),
         'residual_assessment': _serialize_assessment(residual),
+        'assessment_history': [_serialize_assessment(item) for item in reversed(assessments)],
         'threat': risk.threat,
         'vulnerability': risk.vulnerability,
         'consequence': risk.consequence,
+        'source': risk.source,
+        'causes': risk.causes,
+        'existing_measures': risk.existing_measures,
+        'review_date': risk.review_date.isoformat() if risk.review_date else None,
+        'review_overdue': bool(risk.review_date and risk.review_date < _utcnow() and risk.status not in {'Closed', 'Archived'}),
+        'status': risk.status,
+        'acceptance_justification': risk.acceptance_justification,
+        'identified_by': risk.identified_by.full_name if risk.identified_by else 'System',
         'created_at': risk.created_at.isoformat() if risk.created_at else None,
+        'updated_at': risk.updated_at.isoformat() if risk.updated_at else None,
         'treatment_count': len(risk.treatments),
+        'control_count': len(risk.controls),
+        'indicator_count': len(risk.indicators),
+        'incident_count': len(risk.incidents),
+        'attachment_count': len(risk.attachments),
     }
 
 
@@ -472,15 +649,38 @@ def health_check(db: Session = Depends(get_db)) -> dict:
 
 
 @app.post('/api/auth/login')
-def login(payload: dict = Body(...), db: Session = Depends(get_db)) -> dict:
-    username = payload.get('username')
-    password = payload.get('password')
-    if not isinstance(username, str) or not isinstance(password, str) or not username or not password:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Username and password are required')
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not user.is_active or not verify_password(password, user.password_hash):
+def login(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    rate_key = _login_key(request, payload.username)
+    if _login_is_limited(rate_key):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many failed sign-in attempts. Try again later.')
+    user = db.query(User).filter(User.username == payload.username).first()
+    if not user or not user.is_active or not verify_password(payload.password, user.password_hash):
+        _record_login_failure(rate_key)
+        db.add(AuditLog(
+            user_id=user.id if user else None,
+            action='login_failed',
+            details=f'Failed sign-in for username {payload.username[:80]}',
+        ))
+        db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid credentials')
+    _clear_login_failures(rate_key)
     token = create_access_token(user.username)
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite='lax',
+        path='/',
+    )
+    _audit(db, user, 'login_succeeded', 'User signed in')
+    db.commit()
     return {
         'access_token': token,
         'token_type': 'bearer',
@@ -490,8 +690,32 @@ def login(payload: dict = Body(...), db: Session = Depends(get_db)) -> dict:
             'full_name': user.full_name,
             'email': user.email,
             'role': user.role.name if user.role else 'Unknown',
+            'must_change_password': user.must_change_password,
         },
     }
+
+
+@app.post('/api/auth/logout')
+def logout(response: Response) -> dict:
+    response.delete_cookie(key=AUTH_COOKIE_NAME, path='/', secure=_cookie_secure(), samesite='lax')
+    return {'logged_out': True}
+
+
+@app.post('/api/auth/change-password')
+def change_password(
+    payload: PasswordChange,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(status_code=422, detail='Current password is incorrect')
+    if payload.current_password == payload.new_password:
+        raise HTTPException(status_code=422, detail='New password must be different')
+    current_user.password_hash = hash_password(payload.new_password)
+    current_user.must_change_password = False
+    _audit(db, current_user, 'password_changed', 'User changed their password')
+    db.commit()
+    return {'changed': True}
 
 
 @app.get('/api/me')
@@ -504,6 +728,7 @@ def get_me(current_user: User = Depends(get_current_user)) -> dict:
         'role': current_user.role.name if current_user.role else 'Unknown',
         'department_id': current_user.department_id,
         'department': current_user.department.name if current_user.department else None,
+        'must_change_password': current_user.must_change_password,
         'permissions': sorted(ROLE_PERMISSIONS.get(current_user.role.name, ())) if current_user.role else [],
     }
 
@@ -546,6 +771,30 @@ def dashboard_summary(
         for action in actions
     )
     completed_treatments = sum(treatment.status == 'Completed' for treatment in treatments)
+    review_due = sum(
+        bool(risk.review_date and risk.review_date < now and risk.status not in {'Closed', 'Archived'})
+        for risk in risks
+    )
+    control_tests_due = sum(
+        bool(control.next_test_date and control.next_test_date < now and control.status != 'Inactive')
+        for risk in risks
+        for control in risk.controls
+    )
+    critical_indicators = sum(
+        bool(
+            (indicator.direction == 'Above is bad' and indicator.current_value >= indicator.critical_threshold)
+            or (indicator.direction == 'Below is bad' and indicator.current_value <= indicator.critical_threshold)
+        )
+        for risk in risks
+        for indicator in risk.indicators
+    )
+    visible_department_ids = {risk.department_id for risk in risks}
+    if current_user.role.name != 'Department Manager':
+        visible_department_ids = {department.id for department in db.query(Department).all()}
+    open_incidents = db.query(Incident).filter(
+        Incident.department_id.in_(visible_department_ids),
+        Incident.status.in_(['Open', 'Investigating']),
+    ).count() if visible_department_ids else 0
 
     recent_risks = sorted(
         risks,
@@ -580,6 +829,10 @@ def dashboard_summary(
             for treatment in treatments
         ),
         'actions_overdue': overdue_actions,
+        'risk_reviews_due': review_due,
+        'control_tests_due': control_tests_due,
+        'critical_indicators': critical_indicators,
+        'open_incidents': open_incidents,
         'treatment_completion_rate': round(
             completed_treatments * 100 / len(treatments),
             1,
@@ -696,6 +949,9 @@ def list_resources(
             'category': resource.category,
             'description': resource.description,
             'activity_id': resource.activity_id,
+            'activity': resource.activity.name if resource.activity else '',
+            'department_id': resource.activity.department_id if resource.activity else None,
+            'department': resource.activity.department.name if resource.activity and resource.activity.department else '',
         }
         for resource in db.query(Resource).join(Activity).all()
         if can_access_department(current_user, resource.activity.department_id)
@@ -704,15 +960,177 @@ def list_resources(
 
 @app.get('/api/risks')
 def list_risks(
+    query: str | None = Query(default=None, max_length=160),
+    level: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    department_id: int | None = Query(default=None),
+    risk_status: str | None = Query(default=None, alias='status'),
+    limit: int = Query(default=500, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission('risks:read')),
 ) -> list[dict]:
     risks = db.query(Risk).order_by(Risk.created_at.desc()).all()
-    return [
+    rows = [
         _serialize_risk(risk)
         for risk in risks
         if can_access_department(current_user, risk.department_id)
     ]
+    if query:
+        term = query.strip().lower()
+        rows = [row for row in rows if term in f"{row['code']} {row['name']} {row['description']} {row['department']}".lower()]
+    if level:
+        rows = [row for row in rows if row['level'] == level]
+    if category:
+        rows = [row for row in rows if row['category'] == category]
+    if department_id is not None:
+        rows = [row for row in rows if row['department_id'] == department_id]
+    if risk_status:
+        rows = [row for row in rows if row['status'] == risk_status]
+    return rows[offset:offset + limit]
+
+
+@app.get('/api/risks/{risk_id}')
+def get_risk(
+    risk_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission('risks:read')),
+) -> dict:
+    return _serialize_risk(_get_risk(db, risk_id, current_user))
+
+
+@app.post('/api/risks/import', status_code=status.HTTP_201_CREATED)
+async def import_risks(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission('risks:create')),
+) -> dict:
+    if not file.filename:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='A spreadsheet file is required')
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail='Import files are limited to 5 MB')
+    rows = _read_risk_import_rows(file_bytes, file.filename)
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='The uploaded file does not contain any rows to import')
+
+    created_ids: list[int] = []
+    errors: list[str] = []
+
+    for row_number, row in enumerate(rows, start=2):
+        normalized = { _normalize_column_name(key): _normalize_import_value(value) for key, value in row.items() }
+
+        def pick(*keys: str) -> str:
+            for key in keys:
+                value = normalized.get(key)
+                if value is not None and value != '':
+                    return value
+            return ''
+
+        code = pick('code', 'risk_id', 'risk_code', 'risk_number', 'identifier')
+        title = pick('name', 'risk_name', 'risk_title', 'title')
+        department_name = pick('department', 'department_name', 'team')
+        category = pick('category', 'risk_category')
+        description = pick('description', 'risk_description', 'details', 'description_of_risk')
+        probability = pick('probability', 'likelihood', 'probability_score', 'risk_probability')
+        impact = pick('impact', 'impact_score', 'risk_impact')
+        owner_name = pick('owner', 'owner_name', 'assigned_to', 'risk_owner')
+        threat = pick('threat')
+        vulnerability = pick('vulnerability')
+        consequence = pick('consequence', 'potential_consequences', 'business_impact')
+        activity_name = pick('activity', 'activity_name', 'process', 'critical_activity')
+        source = pick('source', 'risk_source', 'origin')
+        causes = pick('causes', 'root_causes', 'cause')
+        existing_measures = pick('existing_measures', 'existing_controls', 'current_controls')
+
+        if not code or not title or not department_name or not category or not description:
+            errors.append(f'Row {row_number}: code, title, department, category, and description are required')
+            continue
+
+        department = db.query(Department).filter(Department.name.ilike(department_name)).first()
+        if department is None:
+            errors.append(f'Row {row_number}: department "{department_name}" was not found')
+            continue
+        if not can_access_department(current_user, department.id):
+            errors.append(f'Row {row_number}: you cannot import risks into department "{department.name}"')
+            continue
+
+        try:
+            probability_value = int(probability) if probability else 3
+            impact_value = int(impact) if impact else 3
+        except ValueError:
+            errors.append(f'Row {row_number}: probability and impact must be numeric values between 1 and 5')
+            continue
+
+        if not 1 <= probability_value <= 5 or not 1 <= impact_value <= 5:
+            errors.append(f'Row {row_number}: probability and impact must be between 1 and 5')
+            continue
+
+        if db.query(Risk).filter(Risk.code == code).first():
+            errors.append(f'Row {row_number}: risk code "{code}" already exists')
+            continue
+
+        activity = None
+        if activity_name:
+            activity = db.query(Activity).filter(
+                Activity.name.ilike(activity_name),
+                Activity.department_id == department.id,
+            ).first()
+            if activity is None:
+                errors.append(f'Row {row_number}: activity "{activity_name}" was not found for department "{department.name}"')
+                continue
+
+        owner = current_user
+        if owner_name:
+            owner = _find_optional_user(db, owner_name, current_user)
+        if owner is None or not owner.is_active:
+            errors.append(f'Row {row_number}: owner "{owner_name or current_user.full_name}" was not found or is inactive')
+            continue
+        if not can_access_department(current_user, owner.department_id or department.id):
+            errors.append(f'Row {row_number}: selected owner is outside your accessible department scope')
+            continue
+
+        risk = Risk(
+            code=code,
+            name=title,
+            description=description,
+            category=category,
+            department_id=department.id,
+            activity_id=activity.id if activity else None,
+            threat=threat or None,
+            vulnerability=vulnerability or None,
+            consequence=consequence or None,
+            source=source or None,
+            causes=causes or None,
+            existing_measures=existing_measures or None,
+            owner_id=owner.id,
+            identified_by_id=current_user.id,
+        )
+        db.add(risk)
+        db.flush()
+
+        score = probability_value * impact_value
+        assessment = RiskAssessment(
+            risk_id=risk.id,
+            probability=probability_value,
+            impact=impact_value,
+            score=score,
+            level=_risk_level(score),
+            assessment_type='Inherent',
+            comments='Imported from spreadsheet',
+        )
+        db.add(assessment)
+        _audit(db, current_user, 'risk_imported', f'Risk {risk.code} imported from spreadsheet', risk.id)
+        created_ids.append(risk.id)
+
+    db.commit()
+    return {
+        'created': len(created_ids),
+        'total_rows': len(rows),
+        'errors': errors,
+        'created_ids': created_ids,
+    }
 
 
 @app.post('/api/risks', status_code=status.HTTP_201_CREATED)
@@ -735,6 +1153,8 @@ def create_risk(
     owner = db.query(User).filter(User.id == owner_id, User.is_active.is_(True)).first()
     if owner is None:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Risk owner does not exist or is inactive')
+    if owner.department_id is not None and not can_access_department(current_user, owner.department_id):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Risk owner is outside your department scope')
 
     risk = Risk(
         code=payload.code,
@@ -746,7 +1166,12 @@ def create_risk(
         threat=payload.threat,
         vulnerability=payload.vulnerability,
         consequence=payload.consequence,
+        source=payload.source,
+        causes=payload.causes,
+        existing_measures=payload.existing_measures,
+        review_date=_normalize_datetime(payload.review_date),
         owner_id=owner.id,
+        identified_by_id=current_user.id,
     )
     db.add(risk)
     db.flush()
@@ -764,6 +1189,48 @@ def create_risk(
     _audit(db, current_user, 'risk_created', f'Risk {risk.code} created', risk.id)
     db.commit()
     return {'id': risk.id, 'code': risk.code, 'score': score, 'level': assessment.level}
+
+
+@app.patch('/api/risks/{risk_id}')
+def update_risk(
+    risk_id: int,
+    payload: RiskUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission('risks:create')),
+) -> dict:
+    risk = _get_risk(db, risk_id, current_user)
+    updates = payload.model_dump(exclude_unset=True)
+    target_department_id = updates.get('department_id', risk.department_id)
+    if not can_access_department(current_user, target_department_id):
+        raise HTTPException(status_code=403, detail='Risk is outside your department scope')
+    if 'department_id' in updates and not db.query(Department).filter(Department.id == target_department_id).first():
+        raise HTTPException(status_code=422, detail='Department does not exist')
+    if 'code' in updates and db.query(Risk).filter(Risk.code == updates['code'], Risk.id != risk.id).first():
+        raise HTTPException(status_code=409, detail='Risk code already exists')
+    if 'activity_id' in updates and updates['activity_id'] is not None:
+        activity = db.query(Activity).filter(Activity.id == updates['activity_id']).first()
+        if activity is None or activity.department_id != target_department_id:
+            raise HTTPException(status_code=422, detail='Activity must belong to the selected department')
+    if 'owner_id' in updates and updates['owner_id'] is not None:
+        owner = db.query(User).filter(User.id == updates['owner_id'], User.is_active.is_(True)).first()
+        if owner is None:
+            raise HTTPException(status_code=422, detail='Risk owner does not exist or is inactive')
+        if owner.department_id is not None and not can_access_department(current_user, owner.department_id):
+            raise HTTPException(status_code=422, detail='Risk owner is outside your department scope')
+    if 'review_date' in updates:
+        updates['review_date'] = _normalize_datetime(updates['review_date'])
+    next_status = updates.get('status', risk.status)
+    justification = updates.get('acceptance_justification', risk.acceptance_justification)
+    if next_status == 'Accepted' and (not justification or len(justification.strip()) < 10):
+        raise HTTPException(status_code=422, detail='Accepted risks require a justification of at least 10 characters')
+    changed_fields = sorted(updates)
+    for field, value in updates.items():
+        setattr(risk, field, value)
+    risk.updated_at = _utcnow()
+    _audit(db, current_user, 'risk_updated', f"Risk {risk.code} updated: {', '.join(changed_fields)}", risk.id)
+    db.commit()
+    db.refresh(risk)
+    return _serialize_risk(risk)
 
 
 @app.post('/api/risks/{risk_id}/assessments', status_code=status.HTTP_201_CREATED)
@@ -903,6 +1370,9 @@ def review_treatment(
     treatment.reviewed_by_id = current_user.id
     treatment.review_comment = payload.comment
     treatment.updated_at = _utcnow()
+    if payload.decision == 'approve':
+        treatment.risk.status = 'Under treatment'
+        treatment.risk.updated_at = _utcnow()
     _audit(
         db,
         current_user,
@@ -961,6 +1431,21 @@ def update_treatment_status(
             assessment_type='Residual',
             comments=f'Residual assessment after treatment #{treatment.id}',
         ))
+        treatment.risk.status = 'Validated'
+        treatment.risk.updated_at = _utcnow()
+
+    if payload.status == 'In progress':
+        treatment.risk.status = 'Under treatment'
+        treatment.risk.updated_at = _utcnow()
+
+    if payload.status == 'Cancelled':
+        other_active = any(
+            item.id != treatment.id and item.status in {'Approved', 'In progress'}
+            for item in treatment.risk.treatments
+        )
+        if not other_active:
+            treatment.risk.status = 'Validated'
+            treatment.risk.updated_at = _utcnow()
 
     treatment.status = payload.status
     treatment.updated_at = _utcnow()
@@ -1097,6 +1582,7 @@ def list_users(
             'department_id': user.department_id,
             'department': user.department.name if user.department else 'Unassigned',
             'is_active': user.is_active,
+            'must_change_password': user.must_change_password,
         }
         for user in users
     ]
@@ -1136,12 +1622,30 @@ def create_user(
         role_id=role.id,
         department_id=payload.department_id,
         is_active=True,
+        must_change_password=True,
     )
     db.add(user)
     db.flush()
     _audit(db, current_user, 'user_created', f'User {user.username} created with role {role.name}')
     db.commit()
     return {'id': user.id, 'username': user.username, 'role': role.name}
+
+
+@app.post('/api/users/{user_id}/reset-password')
+def reset_user_password(
+    user_id: int,
+    payload: PasswordReset,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_permission('users:manage')),
+) -> dict:
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail='User not found')
+    user.password_hash = hash_password(payload.new_password)
+    user.must_change_password = True
+    _audit(db, current_user, 'user_password_reset', f'Password reset for {user.username}')
+    db.commit()
+    return {'id': user.id, 'must_change_password': True}
 
 
 @app.patch('/api/users/{user_id}')
@@ -1177,10 +1681,19 @@ def update_user(
 
 @app.get('/api/audit-logs')
 def list_audit_logs(
+    risk_id: int | None = Query(default=None),
+    action: str | None = Query(default=None, max_length=120),
+    limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission('audit:read')),
 ) -> list[dict]:
-    logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(100).all()
+    query = db.query(AuditLog).order_by(AuditLog.created_at.desc())
+    if risk_id is not None:
+        risk = _get_risk(db, risk_id, current_user)
+        query = query.filter(AuditLog.risk_id == risk.id)
+    if action:
+        query = query.filter(AuditLog.action == action)
+    logs = query.limit(limit).all()
     return [
         {
             'id': record.id,
@@ -1200,32 +1713,40 @@ def export_report(
     format: str = Query(default='pdf', pattern='^(pdf|excel)$'),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_permission('reports:read')),
-) -> FileResponse:
+) -> StreamingResponse:
     risks = [
         risk
         for risk in db.query(Risk).order_by(Risk.code).all()
         if can_access_department(current_user, risk.department_id)
     ]
-    report_dir = Path(__file__).resolve().parent.parent / 'reports'
-    report_dir.mkdir(exist_ok=True)
+
+    def spreadsheet_value(value: object) -> object:
+        if isinstance(value, str) and value.startswith(('=', '+', '-', '@')):
+            return f"'{value}"
+        return value
 
     if format == 'pdf':
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import landscape, letter
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
-        output_path = report_dir / 'smca-risk-report.pdf'
-        document = SimpleDocTemplate(str(output_path), pagesize=landscape(letter))
-        rows = [['Code', 'Risk', 'Department', 'Category', 'Score', 'Level']]
+        output = io.BytesIO()
+        document = SimpleDocTemplate(output, pagesize=landscape(letter))
+        rows = [['Code', 'Risk', 'Department', 'Status', 'Inherent', 'Residual', 'Current', 'Level']]
         for risk in risks:
-            assessment = max(risk.assessments, key=lambda item: item.id, default=None)
+            assessments = sorted(risk.assessments, key=lambda item: (item.assessment_date or datetime.min, item.id))
+            current = assessments[-1] if assessments else None
+            inherent = next((item for item in reversed(assessments) if item.assessment_type == 'Inherent'), None)
+            residual = next((item for item in reversed(assessments) if item.assessment_type == 'Residual'), None)
             rows.append([
                 risk.code,
                 risk.name,
                 risk.department.name if risk.department else '',
-                risk.category,
-                str(assessment.score) if assessment else '—',
-                assessment.level if assessment else 'Unassessed',
+                risk.status,
+                str(inherent.score) if inherent else '—',
+                str(residual.score) if residual else '—',
+                str(current.score) if current else '—',
+                current.level if current else 'Unassessed',
             ])
         table = Table(rows, repeatRows=1)
         table.setStyle(TableStyle([
@@ -1236,30 +1757,45 @@ def export_report(
             ('PADDING', (0, 0), (-1, -1), 7),
         ]))
         document.build([table])
-        return FileResponse(path=str(output_path), media_type='application/pdf', filename='smca-risk-report.pdf')
+        output.seek(0)
+        return StreamingResponse(
+            output,
+            media_type='application/pdf',
+            headers={'Content-Disposition': 'attachment; filename="smca-risk-report.pdf"'},
+        )
 
     import openpyxl
 
-    output_path = report_dir / 'smca-risk-report.xlsx'
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     sheet.title = 'Risk Register'
-    sheet.append(['Code', 'Risk', 'Department', 'Activity', 'Category', 'Score', 'Level', 'Owner'])
+    sheet.append([
+        'Code', 'Risk', 'Department', 'Activity', 'Category', 'Status', 'Owner',
+        'Inherent score', 'Residual score', 'Current score', 'Level', 'Review date',
+        'Controls', 'Treatments', 'Incidents', 'Indicators',
+    ])
     for risk in risks:
-        assessment = max(risk.assessments, key=lambda item: item.id, default=None)
-        sheet.append([
-            risk.code,
-            risk.name,
-            risk.department.name if risk.department else '',
-            risk.activity.name if risk.activity else '',
-            risk.category,
-            assessment.score if assessment else None,
-            assessment.level if assessment else 'Unassessed',
+        assessments = sorted(risk.assessments, key=lambda item: (item.assessment_date or datetime.min, item.id))
+        current = assessments[-1] if assessments else None
+        inherent = next((item for item in reversed(assessments) if item.assessment_type == 'Inherent'), None)
+        residual = next((item for item in reversed(assessments) if item.assessment_type == 'Residual'), None)
+        values = [
+            risk.code, risk.name, risk.department.name if risk.department else '',
+            risk.activity.name if risk.activity else '', risk.category, risk.status,
             risk.owner.full_name if risk.owner else 'Unassigned',
-        ])
-    workbook.save(output_path)
-    return FileResponse(
-        path=str(output_path),
+            inherent.score if inherent else None, residual.score if residual else None,
+            current.score if current else None, current.level if current else 'Unassessed',
+            risk.review_date.isoformat() if risk.review_date else None,
+            len(risk.controls), len(risk.treatments), len(risk.incidents), len(risk.indicators),
+        ]
+        sheet.append([spreadsheet_value(value) for value in values])
+    sheet.freeze_panes = 'A2'
+    sheet.auto_filter.ref = sheet.dimensions
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        output,
         media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        filename='smca-risk-report.xlsx',
+        headers={'Content-Disposition': 'attachment; filename="smca-risk-report.xlsx"'},
     )

@@ -2,7 +2,7 @@
 
 This guide is a hands-on AWS Learner Lab proof of concept (PoC) for the ContinuityOS React/FastAPI/PostgreSQL application in this repository. It also describes a separate production target architecture. Follow the PoC steps first; do not treat the PoC as production-ready.
 
-> **Important security boundary:** the current Compose setup runs Vite's development server and automatically creates demo accounts. The PoC below is for synthetic data and a restricted class demonstration only. It keeps the app reachable through an SSH tunnel, not through a public web port. Do not store real personal, financial, health, or business-confidential data in it.
+> **Important security boundary:** the current Compose setup serves the compiled React frontend through Nginx, but the example environment still enables demo accounts and plain HTTP. The PoC below is for synthetic data and a restricted class demonstration only. It keeps the app reachable through an SSH tunnel, not through a public web port. Do not store real personal, financial, health, or business-confidential data in it.
 
 ## 1. What will be deployed
 
@@ -16,7 +16,7 @@ SSH, permitted only from your current public IP
     |
     v
 One encrypted Amazon EC2 instance
-    |-- Docker Compose: Vite dev server (127.0.0.1:5173)
+    |-- Docker Compose: Nginx + compiled React frontend (127.0.0.1:5173)
     |-- FastAPI backend (127.0.0.1:8000)
     `-- PostgreSQL (127.0.0.1:5432, persistent Docker volume)
 
@@ -25,7 +25,7 @@ CloudWatch metric filter + alarm --> SNS email (if permitted)
 Encrypted S3 bucket <-- encrypted PostgreSQL dumps (if permitted)
 ```
 
-The database, API, and frontend ports are not opened in the EC2 Security Group. The browser reaches the frontend through an SSH tunnel; the Vite container proxies `/api` requests to FastAPI on the private Compose network.
+The database, API, and frontend ports are not opened in the EC2 Security Group. The browser reaches the frontend through an SSH tunnel; Nginx proxies `/api` requests to FastAPI on the private Compose network.
 
 ### Production target (not deployed by the PoC)
 
@@ -41,7 +41,7 @@ CloudTrail --> protected log archive; CloudWatch alarms --> SNS
 AWS Backup / RDS backups --> tested recovery process
 ```
 
-The production target requires replacing the Vite development server, changing the demo account seeding approach, and deploying the app behind HTTPS. Services that are unavailable or restricted in Learner Lab must be marked **target architecture only** in the project report.
+The production target requires disabling demo data, configuring the controlled administrator bootstrap, and deploying the app behind HTTPS. Services that are unavailable or restricted in Learner Lab must be marked **target architecture only** in the project report.
 
 ## 2. Prerequisites and safety checks
 
@@ -162,7 +162,7 @@ Edit `/opt/smca/docker-compose.yml`. Change **only** the three `ports` mappings 
 
   frontend:
     ports:
-      - '127.0.0.1:5173:5173'
+      - '127.0.0.1:5173:80'
 ```
 
 The backend and database remain reachable by the other containers using Compose service names. Binding these ports to loopback prevents external network clients from connecting directly to them. The EC2 Security Group remains a separate network control.
@@ -388,7 +388,7 @@ Before ending the lab:
 | `docker compose` not found | Install the current Compose v2 plugin using Docker's official Amazon Linux instructions |
 | `docker compose config --quiet` fails | Check `.env` exists and each required variable is set; never paste secret values into logs/chat |
 | Backend unhealthy | `sudo docker compose logs --tail=100 db backend`; verify DB health and `.env`; do not delete the data volume to troubleshoot |
-| Frontend works but API fails | Check backend health, frontend logs, and `VITE_BACKEND_PROXY: http://backend:8000` in Compose |
+| Frontend works but API fails | Check backend health and frontend logs; verify the Nginx `/api/` proxy still targets `http://backend:8000` |
 | Browser cannot open app | Keep SSH tunnel running; use `http://localhost:5173`; verify the EC2 loopback curl succeeds |
 | CloudTrail, CloudWatch, SNS, or S3 action denied | Record the permission limitation and use the permitted evidence path; do not create broader credentials or policies |
 
@@ -396,11 +396,11 @@ Before ending the lab:
 
 Do not expose the current Compose deployment directly to the internet. Before production, at minimum:
 
-- Replace Vite's dev server with `npm run build` artifacts served by a maintained production web server; route `/api` through a protected reverse proxy or CloudFront/API origin.
+- Publish the existing production build through S3/CloudFront or another maintained HTTPS origin; route `/api` through a protected reverse proxy or CloudFront/API origin.
 - Require HTTPS with managed certificates; restrict API/database network paths to only required security groups and private subnets.
 - Move PostgreSQL to private Amazon RDS with encryption, automated backups, monitoring, tested point-in-time recovery, and a defined RPO/RTO.
 - Move app secrets to Secrets Manager/Parameter Store; use scoped IAM roles, MFA, individual operator identities, and key rotation.
-- Remove production demo-account seeding and unsafe code defaults; establish the first administrator through a controlled process. The current backend creates seeded users on startup, so changing only the deployment configuration is not sufficient to make it production-safe.
+- Set `APP_ENV=production`, `SEED_DEMO_DATA=false`, `COOKIE_SECURE=true`, and provide the controlled one-time `BOOTSTRAP_ADMIN_*` values. The backend refuses the local signing-key fallback in production.
 - Review app authorization, password policy, MFA requirements, audit-log integrity/retention, dependency/image scanning, patch cadence, incident contacts, and applicable privacy/regulatory obligations.
 - Deploy across multiple Availability Zones where required; add CloudWatch dashboards/alarms, SNS routing, S3 log retention, backup restore tests, and an approved change/release process.
 

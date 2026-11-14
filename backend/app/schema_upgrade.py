@@ -21,6 +21,25 @@ _ADDITIVE_COLUMNS = {
         'expected_result': 'TEXT',
         'resources_required': 'TEXT',
     },
+    'risks': {
+        'source': 'VARCHAR(160)',
+        'causes': 'TEXT',
+        'existing_measures': 'TEXT',
+        'review_date': 'TIMESTAMP',
+        'identified_by_id': 'INTEGER',
+        'status': "VARCHAR(30) NOT NULL DEFAULT 'Draft'",
+        'acceptance_justification': 'TEXT',
+        'updated_at': 'TIMESTAMP',
+    },
+    'users': {
+        'must_change_password': 'BOOLEAN NOT NULL DEFAULT FALSE',
+    },
+    'smca_scopes': {
+        'acceptance_threshold': 'INTEGER NOT NULL DEFAULT 9',
+    },
+    'risk_controls': {
+        'next_test_date': 'TIMESTAMP',
+    },
 }
 
 
